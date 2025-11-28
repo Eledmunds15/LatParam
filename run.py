@@ -1,7 +1,3 @@
-# apptainer exec 00_envs/lmp_CPU_22Jul2025.sif mpirun -np 20 /opt/venv/bin/python3 02_thermalise/run.py --config 00_potentials/malerba.fs --Tmin 0 --Tmax 1200 --linspace 25
-# apptainer exec 00_envs/lmp_CPU_22Jul2025.sif mpirun -np 2 /opt/venv/bin/python3 02_thermalise/run.py --config 00_potentials/malerba.fs --Tmin 0 --Tmax 1200 --linspace 25
-# apptainer exec 00_envs/lmp_CPU_22Jul2025.sif /opt/venv/bin/python3 02_thermalise/run.py --config 00_potentials/malerba.fs --Tmin 0 --Tmax 1200 --linspace 25
-
 # =============================================================
 # LAMMPS Lattice Parameter Exploration (Modified)
 # =============================================================
@@ -32,7 +28,7 @@ size = comm.Get_size()
 # =============================================================
 # LAMMPS Lattice Parameter Exploration (Headless)
 # =============================================================
-def lammpsSim(temperature, potential_file, max_steps=100000, check_interval=100, tol=1e-4, sim_comm=None):
+def lammpsSim(temperature, potential_file, species, max_steps=25000, check_interval=100, tol=1e-4, sim_comm=None):
     """Run a LAMMPS simulation until equilibrium based on lattice relaxation."""
 
     if temperature == 0:
@@ -59,7 +55,6 @@ def lammpsSim(temperature, potential_file, max_steps=100000, check_interval=100,
     # ---------------------------
     eam_calc = EAM(potential_file)
     alat, _, _, _ = get_elastic_constants(calculator=eam_calc, symbol="Fe", verbose=False)
-    lmp.cmd.pair_coeff("* *", potential_file, "Fe")
 
     # ---------------------------
     # Lattice
@@ -70,6 +65,8 @@ def lammpsSim(temperature, potential_file, max_steps=100000, check_interval=100,
     lmp.cmd.create_atoms(1, "box")
 
     lmp.cmd.pair_style("eam/fs")
+    lmp.cmd.pair_coeff("* *", potential_file, species)
+    
     lmp.cmd.neighbor(2.0, "bin")
     lmp.cmd.neigh_modify("delay", 10, "check", "yes")
     lmp.cmd.group("all", "type", "1")
@@ -98,6 +95,7 @@ def lammpsSim(temperature, potential_file, max_steps=100000, check_interval=100,
 # =============================================================
 def parse_args():
     parser = argparse.ArgumentParser(description="Generate edge dislocation configuration.")
+    parser.add_argument("--species", required=True, help="Type of material you want to simulate (e.g. Fe)")
     parser.add_argument("--config", required=True, help="Path to the potential file (e.g., malerba.fs)")
     parser.add_argument("--Tmin", type=float, required=True, help="Minimum temperature (in K)")
     parser.add_argument("--Tmax", type=float, required=True, help="Maximum temperature (in K)")
@@ -119,20 +117,47 @@ def main():
     comm.Barrier()
 
     args = parse_args()
+    
+    if args.Tmin == 0:
+        if rank == 0: raise ValueError("The minimum temperature cannot be 0K")
+
     temperatures = np.linspace(args.Tmin, args.Tmax, args.linspace)
+
     potential_file = os.path.abspath(args.config)
     if not os.path.exists(potential_file):
         raise FileNotFoundError(f"Potential file not found: {potential_file}")
+    species = args.species
 
     if rank == 0:
         print("\n===== Lattice Parameter Exploration =====")
-        print(f"Potential file : {potential_file}")
-        print(f"Tmin           : {args.Tmin} K")
-        print(f"Tmax           : {args.Tmax} K")
-        print(f"Points         : {args.linspace}")
-        print(f"MPI ranks      : {size}")
+        print(f"Potential file               : {potential_file}")
+        print(f"Tmin                         : {min(temperatures)} K")
+        print(f"Tmax                         : {max(temperatures)} K")
+        print(f"Temperature points           : {args.linspace}")
+        print(f"MPI ranks                    : {size}")
+        print("=========================================")
+
+        print("Temperatures to simulate:")
+        print(", ".join(f"{T:.2f}" for T in temperatures))
+
+        sims_per_rank = len(temperatures) / size
+        print(f"\nSimulations per rank (avg.) : {sims_per_rank:.2f}")
         print("=========================================\n")
     
+    # --- Confirmation prompt on rank 0 ---
+    if rank == 0:
+        user_input = input("Are you ready to proceed? (y/n): ").strip().lower()
+    else:
+        user_input = None
+
+    # Broadcast the answer to all ranks
+    user_input = comm.bcast(user_input, root=0)
+
+    if user_input not in ("y", "yes"):
+        if rank == 0:
+            print("Aborting simulation per user request.")
+        return
+
     # --- Create a sub-communicator per rank (1 core per simulation) ---
     sim_comm = comm.Split(color=rank, key=rank)  # each rank gets its own comm
 
@@ -141,7 +166,7 @@ def main():
         if i % size != rank:
             continue  # not this rank's task
         print(f"[Rank {rank}] Running LAMMPS at T = {temp:.2f} K")
-        lammpsSim(temp, potential_file, sim_comm=sim_comm)  # pass sub-comm
+        lammpsSim(temp, potential_file, species, sim_comm=sim_comm)  # pass sub-comm
 
     comm.Barrier()
 
